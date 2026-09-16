@@ -1,0 +1,113 @@
+name: Build upstream release
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream master
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      needed: ${{ steps.upstream.outputs.needed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check for a published build
+        id: upstream
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { check } = require('./.github/scripts/release.cjs');
+            await check({ github, context, core });
+
+  build:
+    name: Build Windows x64
+    needs: check
+    if: needs.check.outputs.needed == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out build automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: automation
+          persist-credentials: false
+      - name: Check out the exact upstream revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Aussiemon/luajit-decompiler-v2
+          ref: ${{ needs.check.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - name: Build and check CLI startup
+        env:
+          SOURCE_COMMIT: ${{ needs.check.outputs.sha }}
+        run: |
+          ./automation/scripts/build.ps1 -SourceDirectory ./source -SourceCommit $env:SOURCE_COMMIT -OutputDirectory "$env:RUNNER_TEMP/decompiler-build"
+      - name: Package binary, license, and build metadata
+        run: |
+          ./automation/scripts/package.ps1 -SourceDirectory ./source -BuildDirectory "$env:RUNNER_TEMP/decompiler-build" -OutputDirectory ./release
+      - name: Transfer release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-x64-${{ needs.check.outputs.sha }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Publish the completed build
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download this run's build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-x64-${{ needs.check.outputs.sha }}
+          path: release
+      - name: Publish or resume a draft
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SOURCE_COMMIT: ${{ needs.check.outputs.sha }}
+        with:
+          script: |
+            const { publish } = require('./.github/scripts/release.cjs');
+            await publish({ github, context, core, exec, sha: process.env.SOURCE_COMMIT, directory: 'release' });
+
+  keepalive:
+    name: Keep the daily schedule active
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow through the API
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.actions.enableWorkflow({ ...context.repo, workflow_id: 'release.yml' });
